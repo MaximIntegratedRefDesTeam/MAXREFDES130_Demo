@@ -85,7 +85,7 @@ void setup()
   while(!Serial);
   Serial.setTimeout(0x7FFFFFFF);
 
-  Serial.println("Starting MAXREFDES130# Demo");
+  Serial.println(F("Starting MAXREFDES130# Demo"));
 
   rtc.begin();
 
@@ -126,14 +126,29 @@ void loop()
   uint8_t relay = 0;
   uint16_t analog_out_ch, analog_val;
   float avo_volts, aio_mA, aii_mA;
-  
-  float aio_slope = 130.0;
-  float aio_offset = -2.0;
-  float aii_slope = 7.71e-3;
-  float aii_offset = 3.86e-3;
-  
+
   MAX11300::CmdResult pixi_result;
   MAX4822::CmdResult rly_drvr_result;
+  
+  float aio_slope = 0;
+  float aio_offset = 0;
+  float aii_slope = 0;
+  float aii_offset = 0;
+  uint16_t calData[4];
+  
+  
+
+  bool currentLoopCal = false;
+  if(check_420_cal(owm, calData))
+  {
+    aio_slope = (((calData[1]*1.0) - (calData[0]*1.0))/16.0);
+    aio_offset = ((-1.0*aio_slope*4.0) + calData[0]);
+    
+    aii_slope = (16.0/((calData[3]*1.0) - (calData[2]*1.0)));
+    aii_offset = ((-1.0*aii_slope*calData[2]) + 4.0);
+    
+    currentLoopCal = true;
+  }
   
   while(user_entry != 15)
   {
@@ -275,32 +290,57 @@ void loop()
         break;
         
         case 11:
-            aio_mA = get_user_float("Please enter a current from 4.0 to 20.0 mA: ", 20.01);
-            analog_val = static_cast<uint16_t>((aio_slope * aio_mA) + aio_offset);
-            
-            pixi_result = pixi.single_ended_dac_write(MAX11300::PIXI_PORT8, analog_val);
-            if(pixi_result != MAX11300::Success)
+            if(currentLoopCal)
             {
-                Serial.println(F("Failed to set 4-20 out"));
+              aio_mA = get_user_float("Please enter a current from 4.0 to 20.0 mA: ", 20.01);
+              analog_val = static_cast<uint16_t>((aio_slope * aio_mA) + aio_offset);
+              
+              pixi_result = pixi.single_ended_dac_write(MAX11300::PIXI_PORT8, analog_val);
+              if(pixi_result != MAX11300::Success)
+              {
+                  Serial.println(F("Failed to set 4-20 out"));
+              }
+            }
+            else
+            {
+              Serial.println(F("Please calibrate 4-20mA loop first, option 13."));
             }
         break;
         
         case 12:
-            pixi_result = pixi.single_ended_adc_read(MAX11300::PIXI_PORT12, analog_val);
-            aii_mA = ((aii_slope*analog_val) + aii_offset);
-            if(pixi_result == MAX11300::Success)
+            if(currentLoopCal)
             {
-                Serial.print(F("4-20 in = "));
-                Serial.println(aii_mA, 2);
+              pixi_result = pixi.single_ended_adc_read(MAX11300::PIXI_PORT12, analog_val);
+              aii_mA = ((aii_slope*analog_val) + aii_offset);
+              if(pixi_result == MAX11300::Success)
+              {
+                  Serial.print(F("4-20 in = "));
+                  Serial.println(aii_mA, 2);
+              }
+              else
+              {
+                  Serial.println(F("Failed to read 4-20 in"));
+              }
             }
             else
             {
-                Serial.println(F("Failed to read 4-20 in"));
+              Serial.println(F("Please calibrate 4-20mA loop first, option 13."));
             }
         break;
         
         case 13:
-            calibrate_420_io(pixi, aio_slope, aio_offset, aii_slope, aii_offset);
+            if(calibrate_420_io(pixi, owm, calData, currentLoopCal))
+            {
+                aio_slope = (((calData[1]*1.0) - (calData[0]*1.0))/16.0);
+                aio_offset = ((-1.0*aio_slope*4.0) + calData[0]);
+                
+                aii_slope = (16.0/((calData[3]*1.0) - (calData[2]*1.0)));
+                aii_offset = ((-1.0*aii_slope*calData[2]) + 4.0);
+            
+                currentLoopCal = true;
+                
+                Serial.println(F("Calibration data saved to 1-Wire EEPROM"));
+            }
         break;
 
         case 14:
@@ -517,14 +557,18 @@ void print_rom_id(RomId & romId)
 }
 
 //*********************************************************************
-void calibrate_420_io(MAX11300 & pixi, 
-float & slope_out, float & offset_out, 
-float & slope_in, float & offset_in)
+bool calibrate_420_io(MAX11300 & pixi, DS2484 & owm, uint16_t *calData, bool loopAlreadyCal)
 {
     char user_entry;
     //initial vals for aio determined imperically on one pcb
     static uint16_t aio_4mA = 518;
     static uint16_t aio_20mA = 2592;
+
+    if(loopAlreadyCal)
+    {
+        aio_4mA = calData[0];
+        aio_20mA = calData[1];
+    }
     uint16_t aii_4mA, aii_20mA;
     
     //cal aio
@@ -588,9 +632,9 @@ float & slope_in, float & offset_in)
         }
     }
     while(user_entry != 'q');
-    
-    slope_out = (((aio_20mA*1.0) - (aio_4mA*1.0))/16.0);
-    offset_out = ((-1.0*slope_out*4.0) + aio_4mA);
+
+    calData[0] = aio_4mA;
+    calData[1] = aio_20mA;
     
     uint8_t idx;
     //cal aii
@@ -601,6 +645,8 @@ float & slope_in, float & offset_in)
         delay(1000);
     }
     pixi.single_ended_adc_read(MAX11300::PIXI_PORT12, aii_4mA);
+
+    calData[2] = aii_4mA;
     
     pixi.single_ended_dac_write(MAX11300::PIXI_PORT8, aio_20mA);
     for(idx = 0; idx < 10; idx++)
@@ -609,13 +655,115 @@ float & slope_in, float & offset_in)
         delay(1000);
     }
     pixi.single_ended_adc_read(MAX11300::PIXI_PORT12, aii_20mA);
+
+    calData[3] = aii_20mA;
+
+    bool rtn_val = false;
+
+    //Write cal data to eeprom
+    OneWireMaster::CmdResult result = owm.OWReset();
+    MultidropRomIterator selector(owm);
+    SearchState search_state;
     
+    DS2431 eeprom(selector);
     
-    slope_in = (16.0/((aii_20mA*1.0) - (aii_4mA*1.0)));
-    offset_in = ((-1.0*slope_in*aii_4mA) + 4.0);
+    search_state.findFamily(0x2D);
+    result = OWNext(owm, search_state);
+    if(result == OneWireMaster::Success)
+    {
+        eeprom.setRomId(search_state.romId);
+        
+        OneWireSlave::CmdResult slaveResult = eeprom.writeMemory(0, "CalTrue!", 8);
+        if(slaveResult == OneWireSlave::Success)
+        {
+            uint8_t writeCalData[8];
+            //cal data stored MSB first;
+            writeCalData[0] = ((aio_4mA >> 8) & 0xFF);
+            writeCalData[1] = (aio_4mA & 0xFF);
+            writeCalData[2] = ((aio_20mA >> 8) & 0xFF);
+            writeCalData[3] = (aio_20mA & 0xFF);
+            writeCalData[4] = ((aii_4mA >> 8) & 0xFF);
+            writeCalData[5] = (aii_4mA & 0xFF);
+            writeCalData[6] = ((aii_20mA >> 8) & 0xFF);
+            writeCalData[7] = (aii_20mA & 0xFF);
+            
+            slaveResult = eeprom.writeMemory(8, writeCalData, 8);
+            if(slaveResult == OneWireSlave::Success)
+            {
+                rtn_val = true;
+                Serial.println(F("Cal Done"));
+                delay(1000);
+            }
+            else
+            {
+                Serial.println(F("Failed to write cal data."));
+            }
+        }
+        else
+        {
+            Serial.println(F("Failed to write cal message."));
+        }
+    }
     
-    Serial.println(F("Cal done."));
-    delay(1000);
+    return rtn_val;
+}
+
+//*********************************************************************
+bool check_420_cal(DS2484 & owm, uint16_t *calData)
+{
+    OneWireMaster::CmdResult result = owm.OWReset();
+    MultidropRomIterator selector(owm);
+    SearchState search_state;
+    
+    DS2431 eeprom(selector);
+    
+    bool rtn_val = false;
+
+    Serial.println();
+    Serial.println(F("Please remove any 1-Wire devices connected to bus on start up and calibrartion of 4-20mA loop."));
+    Serial.println();
+    delay(2500);
+    
+    search_state.findFamily(0x2D);
+    result = OWNext(owm, search_state);
+    if(result == OneWireMaster::Success)
+    {
+        eeprom.setRomId(search_state.romId);
+        uint8_t temp_data[8];
+        
+        OneWireSlave::CmdResult slaveResult = eeprom.readMemory(0, temp_data, 8);
+        
+        if((temp_data[0] == 'C') && (slaveResult == OneWireSlave::Success))
+        {
+            slaveResult = eeprom.readMemory(8, temp_data, 8);
+            if(slaveResult == OneWireSlave::Success)
+            {
+                calData[0] = ((temp_data[0] << 8) | temp_data[1]);
+                calData[1] = ((temp_data[2] << 8) | temp_data[3]);
+                calData[2] = ((temp_data[4] << 8) | temp_data[5]);
+                calData[3] = ((temp_data[6] << 8) | temp_data[7]);
+                
+                rtn_val = true;
+            }
+            else
+            {
+                Serial.println(F("Failed to read row 1 of EEPROM"));
+            }
+        }
+        else
+        {
+            if(slaveResult == OneWireSlave::Success)
+            {
+               Serial.println(F("No cal data stored, please calibrate 4-20mA loop"));
+            }
+            else
+            {
+                Serial.println(F("Failed to read row 0 of EEPROM"));
+            }
+        }
+    }
+    
+    return rtn_val;
 }
 
 //*********************************************************************
